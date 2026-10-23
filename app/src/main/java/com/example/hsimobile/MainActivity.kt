@@ -121,7 +121,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+// Added ExperimentalLayoutApi to fix the compile error
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun HsiApp() {
     val context = LocalContext.current
@@ -680,6 +681,8 @@ fun loadH5FromUri(context: Context, uri: Uri): HsiData {
             b = shape[2]
 
             val flatRaw = cubeDs.getDataFlat()
+            
+            // OPTIMIZATION: If the file is already float32, use it directly to save 50% RAM
             flatCube = when (flatRaw) {
                 is FloatArray -> flatRaw
                 is DoubleArray -> FloatArray(flatRaw.size) { flatRaw[it].toFloat() }
@@ -699,7 +702,7 @@ fun loadH5FromUri(context: Context, uri: Uri): HsiData {
 
         return HsiData(flatCube!!, wls!!, h, w, b)
     } catch (e: OutOfMemoryError) {
-        throw Exception("File is too large for your phone's memory. Try cropping or binning the data to a smaller size.")
+        throw Exception("File is too large for your phone's RAM. Try cropping or binning the data to a smaller size on your PC.")
     } finally {
         tmp.delete() 
     }
