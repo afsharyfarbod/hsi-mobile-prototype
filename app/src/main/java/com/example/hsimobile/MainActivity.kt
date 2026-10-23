@@ -296,8 +296,11 @@ fun jetColor(v: Float): Color {
 }
 
 fun findDataset(hdf: HdfFile, name: String): Dataset {
-    val node = hdf.nodeByPath(name) ?: hdf.nodeByPath("/$name")
+    // Try finding the dataset by name, then with a leading slash
+    val node = try { hdf.getByPath(name) } catch (e: Exception) { null }
+        ?: try { hdf.getByPath("/$name") } catch (e: Exception) { null }
         ?: throw IllegalArgumentException("Dataset '$name' not found in file root")
+        
     return node as? Dataset
         ?: throw IllegalArgumentException("'$name' exists but is not a dataset")
 }
