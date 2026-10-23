@@ -29,8 +29,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.chaquo.python.Python
-import com.chaquo.python.android.AndroidPlatform
 import io.jhdf.HdfFile
 import io.jhdf.api.Dataset
 import java.io.File
@@ -116,12 +114,6 @@ data class SpectrumRecord(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        // INITIALIZE PYTHON
-        if (!Python.isStarted()) {
-            Python.start(AndroidPlatform(this))
-        }
-
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -163,7 +155,7 @@ fun HsiApp() {
             spectra = emptyList()
             Thread {
                 try {
-                    val data = loadH5WithPython(context, uri)
+                    val data = loadH5FromUri(context, uri)
                     android.os.Handler(android.os.Looper.getMainLooper()).post {
                         hsi = data
                         selectedBand = 0
@@ -327,8 +319,7 @@ fun HsiApp() {
                 if (!loading) {
                     Spacer(Modifier.height(24.dp))
                     Text(
-                        "Tap 'Select .h5 File' to load a hyperspectral cube.\n\n" +
-                                "Large files will be automatically binned using the on-device Python engine.",
+                        "Tap 'Select .h5 File' to load a hyperspectral cube.",
                         fontSize = 13.sp
                     )
                 }
@@ -653,37 +644,75 @@ fun findDataset(hdf: HdfFile, name: String): Dataset {
     return node as? Dataset ?: throw IllegalArgumentException("'$name' exists but is not a dataset")
 }
 
-fun loadH5WithPython(context: Context, uri: Uri): HsiData {
-    val tmpInput = File(context.cacheDir, "raw_input_${System.currentTimeMillis()}.h5")
+fun loadH5FromUri(context: Context, uri: Uri): HsiData {
+    val tmp = File(context.cacheDir, "input_${System.currentTimeMillis()}.h5")
     context.contentResolver.openInputStream(uri)?.use { input ->
-        tmpInput.outputStream().use { output -> input.copyTo(output) }
+        tmp.outputStream().use { output -> input.copyTo(output) }
     } ?: throw IllegalStateException("Cannot open file from picker")
 
-    val tmpBinned = File(context.cacheDir, "binned_${System.currentTimeMillis()}.h5")
-
     try {
-        val py = Python.getInstance()
-        val pyObj = py.getModule("hsi_processor")
-        val binFactor = pyObj.callAttr("bin_if_needed", tmpInput.absolutePath, tmpBinned.absolutePath).toInt()
-
-        var flatCube: FloatArray? = null
+        var finalCube: FloatArray? = null
         var wls: FloatArray? = null
-        var h = 0; var w = 0; var b = 0
+        var newH = 0; var newW = 0; var b = 0
+        var origH = 0; var origW = 0
+        var spatialBin = 1
 
-        HdfFile(tmpBinned.toPath()).use { hdf ->
+        HdfFile(tmp.toPath()).use { hdf ->
             val cubeDs = findDataset(hdf, "cube")
             val wlDs = findDataset(hdf, "wavelengths")
 
             val shape = cubeDs.getDimensions()
-            h = shape[0].toInt()
-            w = shape[1].toInt()
+            origH = shape[0].toInt()
+            origW = shape[1].toInt()
             b = shape[2].toInt()
 
-            val flatRaw = cubeDs.getDataFlat()
-            flatCube = when (flatRaw) {
-                is FloatArray -> flatRaw
-                is DoubleArray -> FloatArray(flatRaw.size) { flatRaw[it].toFloat() }
-                else -> throw IllegalStateException("cube must be float32")
+            // Read the entire file as a flat array
+            val rawAny = cubeDs.getDataFlat()
+            val flatRaw = when (rawAny) {
+                is FloatArray -> rawAny
+                is DoubleArray -> FloatArray(rawAny.size) { rawAny[it].toFloat() }
+                else -> throw IllegalStateException("cube must be float32 or float64")
+            }
+
+            // AUTO-BINNING LOGIC (in memory)
+            val maxElements = 50_000_000L 
+            spatialBin = 1
+            while ((origH / spatialBin).toLong() * (origW / spatialBin).toLong() * b.toLong() > maxElements) {
+                spatialBin++
+            }
+
+            newH = max(1, origH / spatialBin)
+            newW = max(1, origW / spatialBin)
+
+            if (spatialBin == 1) {
+                finalCube = flatRaw
+            } else {
+                val binnedCube = FloatArray(newH * newW * b)
+                
+                for (yOut in 0 until newH) {
+                    for (xOut in 0 until newW) {
+                        val outOffset = (yOut * newW + xOut) * b
+                        for (bIdx in 0 until b) {
+                            var sum = 0f
+                            var count = 0
+                            for (dy in 0 until spatialBin) {
+                                val srcY = yOut * spatialBin + dy
+                                if (srcY >= origH) continue
+                                for (dx in 0 until spatialBin) {
+                                    val srcX = xOut * spatialBin + dx
+                                    if (srcX >= origW) continue
+                                    
+                                    val srcOffset = (srcY * origW + srcX) * b + bIdx
+                                    sum += flatRaw[srcOffset]
+                                    count++
+                                }
+                            }
+                            binnedCube[outOffset + bIdx] = if (count > 0) sum / count else 0f
+                        }
+                    }
+                }
+                finalCube = binnedCube
+                System.gc() // Free flatRaw immediately
             }
 
             val wlRaw = wlDs.getDataFlat()
@@ -693,14 +722,14 @@ fun loadH5WithPython(context: Context, uri: Uri): HsiData {
                 else -> throw IllegalStateException("wavelengths must be 1D float")
             }
         }
+        
+        System.gc()
 
-        val origH = h * binFactor
-        val origW = w * binFactor
-
-        return HsiData(flatCube!!, wls!!, h, w, b, binFactor, origH, origW)
+        return HsiData(finalCube!!, wls!!, newH, newW, b, spatialBin, origH, origW)
+    } catch (e: OutOfMemoryError) {
+        throw Exception("File is too large for your phone's RAM even with auto-binning.")
     } finally {
-        tmpInput.delete()
-        tmpBinned.delete()
+        tmp.delete() 
     }
 }
 
