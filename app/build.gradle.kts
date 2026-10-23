@@ -14,8 +14,10 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     buildTypes {
@@ -28,21 +30,26 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+    
     kotlinOptions {
         jvmTarget = "17"
     }
+    
     buildFeatures {
         compose = true
     }
+    
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
     }
+    
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
 }
+
 chaquopy {
     defaultConfig {
         buildPython("python3")
@@ -52,6 +59,7 @@ chaquopy {
         }
     }
 }
+
 dependencies {
     implementation("io.jhdf:jhdf:0.8.0")
     implementation(platform("androidx.compose:compose-bom:2024.09.02"))
