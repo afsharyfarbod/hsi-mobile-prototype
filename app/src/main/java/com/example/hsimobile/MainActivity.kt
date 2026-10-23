@@ -42,7 +42,10 @@ class HsiData(
     val wavelengths: FloatArray,
     val height: Int,
     val width: Int,
-    val bands: Int
+    val bands: Int,
+    val spatialBin: Int = 1,
+    val origHeight: Int = height,
+    val origWidth: Int = width
 ) {
     fun getBand(bandIndex: Int): FloatArray {
         val out = FloatArray(height * width)
@@ -121,7 +124,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// Added ExperimentalLayoutApi to fix the compile error
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun HsiApp() {
@@ -195,6 +197,16 @@ fun HsiApp() {
             }
 
             hsi?.let { data ->
+                Spacer(Modifier.height(8.dp))
+                
+                // Auto-binning warning
+                if (data.spatialBin > 1) {
+                    Text(
+                        "⚠️ Auto-binned ${data.spatialBin}×${data.spatialBin} to fit memory. (Original: ${data.origHeight}×${data.origWidth} → New: ${data.height}×${data.width})",
+                        color = Color(0xFFD32F2F), fontSize = 12.sp
+                    )
+                }
+
                 Spacer(Modifier.height(16.dp))
                 
                 // --- Display Modes ---
@@ -513,11 +525,11 @@ fun HeatmapCanvas(
             isFakeBoldText = true
         }
 
-        // X Ticks & Labels
+        // X Ticks & Labels (Note: Maps new binned coordinates back to original for clarity if binned)
         for (i in 0..5) {
             val frac = i / 5f
             val xPos = padL + frac * imgW
-            val valX = (frac * data.width).toInt()
+            val valX = (frac * data.origWidth).toInt()
             drawLine(Color.Black, Offset(xPos, padT + imgH), Offset(xPos, padT + imgH + 10f), strokeWidth = 2f)
             drawContext.canvas.nativeCanvas.drawText("$valX", xPos, padT + imgH + 40f, textPaintAxes)
         }
@@ -528,7 +540,7 @@ fun HeatmapCanvas(
         for (i in 0..5) {
             val frac = i / 5f
             val yPos = padT + imgH - frac * imgH
-            val valY = (frac * data.height).toInt()
+            val valY = (frac * data.origHeight).toInt()
             drawLine(Color.Black, Offset(padL, yPos), Offset(padL - 10f, yPos), strokeWidth = 2f)
             drawContext.canvas.nativeCanvas.drawText("$valY", padL - 15f, yPos + 10f, textPaintY)
         }
@@ -668,25 +680,57 @@ fun loadH5FromUri(context: Context, uri: Uri): HsiData {
     try {
         var flatCube: FloatArray? = null
         var wls: FloatArray? = null
-        var h = 0; var w = 0; var b = 0
+        var newH = 0; var newW = 0; var b = 0
+        var origH = 0; var origW = 0
+        var spatialBin = 1
 
-        // Force the HDF file to be completely closed so it releases memory
         HdfFile(tmp.toPath()).use { hdf ->
             val cubeDs = findDataset(hdf, "cube")
             val wlDs = findDataset(hdf, "wavelengths")
 
             val shape = cubeDs.getDimensions()
-            h = shape[0]
-            w = shape[1]
-            b = shape[2]
+            origH = shape[0].toInt()
+            origW = shape[1].toInt()
+            b = shape[2].toInt()
 
-            val flatRaw = cubeDs.getDataFlat()
+            // AUTO-BINNING LOGIC
+            val rawBytes = origH.toLong() * origW.toLong() * b.toLong() * 4L
+            val maxBytes = 200L * 1024L * 1024L // 200MB safe limit
+
+            spatialBin = 1
+            while ((origH / spatialBin).toLong() * (origW / spatialBin).toLong() * b.toLong() * 4L > maxBytes) {
+                spatialBin++
+            }
             
-            // OPTIMIZATION: If the file is already float32, use it directly to save 50% RAM
-            flatCube = when (flatRaw) {
-                is FloatArray -> flatRaw
-                is DoubleArray -> FloatArray(flatRaw.size) { flatRaw[it].toFloat() }
-                else -> throw IllegalStateException("cube must be float32 or float64")
+            newH = max(1, origH / spatialBin)
+            newW = max(1, origW / spatialBin)
+
+            flatCube = FloatArray(newH * newW * b)
+            val binArea = (spatialBin * spatialBin).toFloat()
+
+            // Read row-by-row to keep memory tiny during the read process
+            for (yOut in 0 until newH) {
+                val offsetY = (yOut * spatialBin).toLong()
+                val offsets = longArrayOf(offsetY, 0, 0)
+                
+                // Read `spatialBin` rows of the original width
+                val chunkData = cubeDs.getData(offsets, intArrayOf(spatialBin, origW, b)) as Array<Array<FloatArray>>
+                
+                for (xOut in 0 until newW) {
+                    val outOffset = (yOut * newW + xOut) * b
+                    for (bIdx in 0 until b) {
+                        var sum = 0f
+                        for (dy in 0 until spatialBin) {
+                            for (dx in 0 until spatialBin) {
+                                val srcX = xOut * spatialBin + dx
+                                if (srcX < origW) {
+                                    sum += chunkData[dy][srcX][bIdx]
+                                }
+                            }
+                        }
+                        flatCube!![outOffset + bIdx] = sum / binArea
+                    }
+                }
             }
 
             val wlRaw = wlDs.getDataFlat()
@@ -697,12 +741,11 @@ fun loadH5FromUri(context: Context, uri: Uri): HsiData {
             }
         }
         
-        // Force garbage collection to clear the massive file reading buffers
         System.gc()
 
-        return HsiData(flatCube!!, wls!!, h, w, b)
+        return HsiData(flatCube!!, wls!!, newH, newW, b, spatialBin, origH, origW)
     } catch (e: OutOfMemoryError) {
-        throw Exception("File is too large for your phone's RAM. Try cropping or binning the data to a smaller size on your PC.")
+        throw Exception("File is too large for your phone's RAM even with auto-binning.")
     } finally {
         tmp.delete() 
     }
