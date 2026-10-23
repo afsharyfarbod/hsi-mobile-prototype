@@ -16,6 +16,11 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
