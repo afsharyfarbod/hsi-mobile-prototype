@@ -99,7 +99,7 @@ class HsiData(
 }
 
 data class DrawnShape(
-    val type: String, // "point" or "rect"
+    val type: String,
     val x1: Int, val y1: Int,
     val x2: Int, val y2: Int,
     val number: Int
@@ -140,14 +140,12 @@ fun HsiApp() {
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     
-    // Display Settings
     var displayMode by remember { mutableStateOf("Single Band") }
     var selectedBand by remember { mutableIntStateOf(0) }
     var rWl by remember { mutableFloatStateOf(650f) }
     var gWl by remember { mutableFloatStateOf(550f) }
     var bWl by remember { mutableFloatStateOf(450f) }
 
-    // Selection Settings
     var selectionMode by remember { mutableStateOf("Single Pixel") }
     var shapes by remember { mutableStateOf<List<DrawnShape>>(emptyList()) }
     var spectra by remember { mutableStateOf<List<SpectrumRecord>>(emptyList()) }
@@ -339,11 +337,315 @@ fun HsiApp() {
     }
 }
 
-// ... (Keep HeatmapCanvas, SpectrumCanvas, findClosestBand, jetColor, saveCsv exactly as they are in your current file) ...
-// NOTE: I am omitting them here to save space, but DO NOT delete them from your file. 
-// Copy them from your previous MainActivity.kt and paste them below this function.
+@Composable
+fun HeatmapCanvas(
+    data: HsiData,
+    displayMode: String,
+    band: Int,
+    rWl: Float, gWl: Float, bWl: Float,
+    selectionMode: String,
+    shapes: List<DrawnShape>,
+    onExtractSpectrum: (String, Int, Int, Int, Int, FloatArray) -> Unit
+) {
+    var dragStart by remember { mutableStateOf<Offset?>(null) }
+    var dragEnd by remember { mutableStateOf<Offset?>(null) }
 
-// ---------- File Loading & Saving (UPDATED TO USE PYTHON) ----------
+    val padLeft = 55.dp
+    val padBottom = 50.dp
+    val padTop = 15.dp
+    val padRight = 15.dp
+
+    val visualData = remember(data, displayMode, band, rWl, gWl, bWl) {
+        when (displayMode) {
+            "Single Band" -> data.getBand(band)
+            "Global Sum" -> data.getGlobalSum()
+            "RGB" -> {
+                val rIdx = findClosestBand(data.wavelengths, rWl)
+                val gIdx = findClosestBand(data.wavelengths, gWl)
+                val bIdx = findClosestBand(data.wavelengths, bWl)
+                val r = data.getBand(rIdx)
+                val g = data.getBand(gIdx)
+                val b = data.getBand(bIdx)
+                val rgb = FloatArray(r.size * 3)
+                for (i in r.indices) {
+                    rgb[i * 3] = r[i]
+                    rgb[i * 3 + 1] = g[i]
+                    rgb[i * 3 + 2] = b[i]
+                }
+                rgb
+            }
+            else -> FloatArray(0)
+        }
+    }
+
+    val (mn, mx) = remember(visualData) {
+        var min = Float.MAX_VALUE
+        var max = -Float.MAX_VALUE
+        for (v in visualData) {
+            if (v < min) min = v
+            if (v > max) max = v
+        }
+        if (max - min < 1e-8f) min to (min + 1f) else min to max
+    }
+    val span = (mx - mn).coerceAtLeast(1e-6f)
+
+    Canvas(
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(data.width.toFloat() / data.height.toFloat())
+            .background(Color.White)
+            .pointerInput(data, selectionMode, visualData) {
+                val padL = padLeft.toPx()
+                val padB = padBottom.toPx()
+                val padT = padTop.toPx()
+                val padR = padRight.toPx()
+                
+                val imgW = size.width - padL - padR
+                val imgH = size.height - padT - padB
+
+                if (selectionMode == "Single Pixel") {
+                    detectTapGestures { offset ->
+                        if (offset.x < padL || offset.x > padL + imgW || offset.y < padT || offset.y > padT + imgH) return@detectTapGestures
+                        val px = ((offset.x - padL) / imgW * data.width).toInt().coerceIn(0, data.width - 1)
+                        val py = ((offset.y - padT) / imgH * data.height).toInt().coerceIn(0, data.height - 1)
+                        val spec = data.getPixel(px, py)
+                        onExtractSpectrum("point", px, py, px, py, spec)
+                    }
+                } else {
+                    detectDragGestures(
+                        onDragStart = { 
+                            if (it.x >= padL && it.x <= padL + imgW && it.y >= padT && it.y <= padT + imgH) {
+                                dragStart = it
+                                dragEnd = it
+                            }
+                        },
+                        onDrag = { change, _ -> change.consume(); dragEnd = change.position },
+                        onDragEnd = {
+                            val start = dragStart
+                            val end = dragEnd
+                            if (start != null && end != null) {
+                                val x1 = ((start.x - padL) / imgW * data.width).toInt().coerceIn(0, data.width - 1)
+                                val y1 = ((start.y - padT) / imgH * data.height).toInt().coerceIn(0, data.height - 1)
+                                val x2 = ((end.x - padL) / imgW * data.width).toInt().coerceIn(0, data.width - 1)
+                                val y2 = ((end.y - padT) / imgH * data.height).toInt().coerceIn(0, data.height - 1)
+                                val spec = data.getRoiAverage(x1, y1, x2, y2)
+                                onExtractSpectrum("rect", x1, y1, x2, y2, spec)
+                            }
+                            dragStart = null
+                            dragEnd = null
+                        }
+                    )
+                }
+            }
+    ) {
+        val padL = padLeft.toPx()
+        val padB = padBottom.toPx()
+        val padT = padTop.toPx()
+        val padR = padRight.toPx()
+
+        val imgW = size.width - padL - padR
+        val imgH = size.height - padT - padB
+
+        val cellW = imgW / data.width
+        val cellH = imgH / data.height
+
+        for (y in 0 until data.height) {
+            for (x in 0 until data.width) {
+                if (displayMode == "RGB") {
+                    val idx = (y * data.width + x) * 3
+                    drawRect(
+                        color = Color(
+                            (visualData[idx] - mn) / span,
+                            (visualData[idx + 1] - mn) / span,
+                            (visualData[idx + 2] - mn) / span
+                        ),
+                        topLeft = Offset(padL + x * cellW, padT + y * cellH),
+                        size = Size(cellW + 1f, cellH + 1f)
+                    )
+                } else {
+                    val v = (visualData[y * data.width + x] - mn) / span
+                    drawRect(
+                        color = jetColor(v),
+                        topLeft = Offset(padL + x * cellW, padT + y * cellH),
+                        size = Size(cellW + 1f, cellH + 1f)
+                    )
+                }
+            }
+        }
+
+        val textPaint = android.graphics.Paint().apply {
+            color = android.graphics.Color.WHITE
+            textSize = 35f
+            textAlign = android.graphics.Paint.Align.CENTER
+            setShadowLayer(4f, 0f, 0f, android.graphics.Color.BLACK)
+        }
+
+        shapes.forEach { shape ->
+            if (shape.type == "point") {
+                val cx = padL + (shape.x1 + 0.5f) * cellW
+                val cy = padT + (shape.y1 + 0.5f) * cellH
+                drawCircle(Color.Red, radius = 12f, center = Offset(cx, cy))
+                drawCircle(Color.White, radius = 12f, center = Offset(cx, cy), style = Stroke(width = 3f))
+                drawContext.canvas.nativeCanvas.drawText("${shape.number}", cx, cy + 12f, textPaint)
+            } else {
+                val left = padL + shape.x1 * cellW
+                val top = padT + shape.y1 * cellH
+                val rw = (shape.x2 - shape.x1 + 1) * cellW
+                val rh = (shape.y2 - shape.y1 + 1) * cellH
+                drawRect(Color.Red, topLeft = Offset(left, top), size = Size(rw, rh), style = Stroke(width = 4f))
+                drawContext.canvas.nativeCanvas.drawText("${shape.number}", left + rw/2, top + rh/2 + 12f, textPaint)
+            }
+        }
+
+        if (dragStart != null && dragEnd != null && selectionMode == "Rectangle ROI") {
+            val topLeft = Offset(min(dragStart!!.x, dragEnd!!.x), min(dragStart!!.y, dragEnd!!.y))
+            val size = Size(abs(dragStart!!.x - dragEnd!!.x), abs(dragStart!!.y - dragEnd!!.y))
+            drawRect(Color.Yellow, topLeft, size, style = Stroke(width = 3f))
+        }
+
+        drawLine(Color.Black, Offset(padL, padT), Offset(padL, padT + imgH), strokeWidth = 3f)
+        drawLine(Color.Black, Offset(padL, padT + imgH), Offset(padL + imgW, padT + imgH), strokeWidth = 3f)
+
+        val textPaintAxes = android.graphics.Paint().apply {
+            color = android.graphics.Color.BLACK
+            textSize = 30f
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+        val textPaintY = android.graphics.Paint(textPaintAxes).apply {
+            textAlign = android.graphics.Paint.Align.RIGHT
+        }
+        val titlePaint = android.graphics.Paint(textPaintAxes).apply {
+            textSize = 35f
+            isFakeBoldText = true
+        }
+
+        for (i in 0..5) {
+            val frac = i / 5f
+            val xPos = padL + frac * imgW
+            val valX = (frac * data.origWidth).toInt()
+            drawLine(Color.Black, Offset(xPos, padT + imgH), Offset(xPos, padT + imgH + 10f), strokeWidth = 2f)
+            drawContext.canvas.nativeCanvas.drawText("$valX", xPos, padT + imgH + 40f, textPaintAxes)
+        }
+        drawContext.canvas.nativeCanvas.drawText("X (px)", padL + imgW/2, size.height - 5f, titlePaint)
+
+        for (i in 0..5) {
+            val frac = i / 5f
+            val yPos = padT + imgH - frac * imgH
+            val valY = (frac * data.origHeight).toInt()
+            drawLine(Color.Black, Offset(padL, yPos), Offset(padL - 10f, yPos), strokeWidth = 2f)
+            drawContext.canvas.nativeCanvas.drawText("$valY", padL - 15f, yPos + 10f, textPaintY)
+        }
+        drawContext.canvas.nativeCanvas.save()
+        drawContext.canvas.nativeCanvas.rotate(-90f, 15f, padT + imgH/2)
+        drawContext.canvas.nativeCanvas.drawText("Y (px)", 15f, padT + imgH/2, titlePaint)
+        drawContext.canvas.nativeCanvas.restore()
+    }
+}
+
+@Composable
+fun SpectrumCanvas(data: HsiData, spectra: List<SpectrumRecord>) {
+    val minWl = data.wavelengths.minOrNull() ?: 0f
+    val maxWl = data.wavelengths.maxOrNull() ?: 1f
+    val spanWl = (maxWl - minWl).coerceAtLeast(1e-6f)
+
+    val (minInt, maxInt) = remember(spectra) {
+        var mn = Float.MAX_VALUE
+        var mx = -Float.MAX_VALUE
+        spectra.forEach { rec ->
+            rec.data.forEach { v ->
+                if (v < mn) mn = v
+                if (v > mx) mx = v
+            }
+        }
+        if (spectra.isEmpty()) 0f to 1f else (mn to mx)
+    }
+    val spanInt = (maxInt - minInt).coerceAtLeast(1e-6f)
+
+    Canvas(modifier = Modifier.fillMaxWidth().height(300.dp).background(Color.White)) {
+        val padLeft = 70.dp.toPx()
+        val padBottom = 70.dp.toPx()
+        val padTop = 20.dp.toPx()
+        val padRight = 20.dp.toPx()
+
+        val w = size.width - padLeft - padRight
+        val h = size.height - padTop - padBottom
+
+        drawLine(Color.Black, Offset(padLeft, padTop), Offset(padLeft, padTop + h), strokeWidth = 3f)
+        drawLine(Color.Black, Offset(padLeft, padTop + h), Offset(padLeft + w, padTop + h), strokeWidth = 3f)
+
+        spectra.forEach { rec ->
+            val path = Path()
+            val n = rec.data.size
+            for (i in 0 until n) {
+                val x = padLeft + (i.toFloat() / (n - 1).coerceAtLeast(1)) * w
+                val y = padTop + h - ((rec.data[i] - minInt) / spanInt) * h
+                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            val stroke = if (rec.isReference) Stroke(width = 4f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 10f))) else Stroke(width = 2f)
+            drawPath(path, rec.color, style = stroke)
+        }
+
+        val textPaint = android.graphics.Paint().apply {
+            color = android.graphics.Color.BLACK
+            textSize = 30f
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+        val textPaintY = android.graphics.Paint(textPaint).apply {
+            textAlign = android.graphics.Paint.Align.RIGHT
+        }
+        val titlePaint = android.graphics.Paint(textPaint).apply {
+            textSize = 35f
+            isFakeBoldText = true
+        }
+
+        for (i in 0..4) {
+            val frac = i / 4f
+            val xPos = padLeft + frac * w
+            val valX = minWl + frac * spanWl
+            drawLine(Color.Black, Offset(xPos, padTop + h), Offset(xPos, padTop + h + 10f), strokeWidth = 2f)
+            drawContext.canvas.nativeCanvas.drawText("%.0f".format(valX), xPos, padTop + h + 40f, textPaint)
+        }
+        drawContext.canvas.nativeCanvas.drawText("Wavelength (nm)", padLeft + w/2, size.height - 10f, titlePaint)
+
+        for (i in 0..4) {
+            val frac = i / 4f
+            val yPos = padTop + h - frac * h
+            val valY = minInt + frac * spanInt
+            drawLine(Color.Black, Offset(padLeft, yPos), Offset(padLeft - 10f, yPos), strokeWidth = 2f)
+            drawContext.canvas.nativeCanvas.drawText("%.2f".format(valY), padLeft - 15f, yPos + 10f, textPaintY)
+        }
+        drawContext.canvas.nativeCanvas.save()
+        drawContext.canvas.nativeCanvas.rotate(-90f, 20f, padTop + h/2)
+        drawContext.canvas.nativeCanvas.drawText("Intensity", 20f, padTop + h/2, titlePaint)
+        drawContext.canvas.nativeCanvas.restore()
+    }
+}
+
+fun findClosestBand(wls: FloatArray, target: Float): Int {
+    var best = 0
+    var minDiff = Float.MAX_VALUE
+    for (i in wls.indices) {
+        val diff = abs(wls[i] - target)
+        if (diff < minDiff) {
+            minDiff = diff
+            best = i
+        }
+    }
+    return best
+}
+
+fun jetColor(v: Float): Color {
+    val t = v.coerceIn(0f, 1f)
+    val r: Float; val g: Float; val b: Float
+    when {
+        t < 0.25f -> { r = 0f; g = 4 * t; b = 1f }
+        t < 0.5f -> { r = 0f; g = 1f; b = 1f - 4 * (t - 0.25f) }
+        t < 0.75f -> { r = 4 * (t - 0.5f); g = 1f; b = 0f }
+        else -> { r = 1f; g = 1f - 4 * (t - 0.75f); b = 0f }
+    }
+    return Color(r, g, b)
+}
+
 fun findDataset(hdf: HdfFile, name: String): Dataset {
     val node = try { hdf.getByPath(name) } catch (e: Exception) { null }
         ?: try { hdf.getByPath("/$name") } catch (e: Exception) { null }
@@ -360,12 +662,10 @@ fun loadH5WithPython(context: Context, uri: Uri): HsiData {
     val tmpBinned = File(context.cacheDir, "binned_${System.currentTimeMillis()}.h5")
 
     try {
-        // 1. Run the Python script to bin the file natively in C-memory
         val py = Python.getInstance()
         val pyObj = py.getModule("hsi_processor")
         val binFactor = pyObj.callAttr("bin_if_needed", tmpInput.absolutePath, tmpBinned.absolutePath).toInt()
 
-        // 2. Load the small binned file using Java (no memory crash now)
         var flatCube: FloatArray? = null
         var wls: FloatArray? = null
         var h = 0; var w = 0; var b = 0
@@ -394,8 +694,6 @@ fun loadH5WithPython(context: Context, uri: Uri): HsiData {
             }
         }
 
-        // We don't know the original size easily without re-reading, but we can approximate 
-        // for the UI warning based on the bin factor.
         val origH = h * binFactor
         val origW = w * binFactor
 
@@ -404,4 +702,27 @@ fun loadH5WithPython(context: Context, uri: Uri): HsiData {
         tmpInput.delete()
         tmpBinned.delete()
     }
+}
+
+fun saveCsv(context: Context, data: HsiData, spectra: List<SpectrumRecord>): String {
+    val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+    val name = "spectra_${System.currentTimeMillis()}.csv"
+    val file = File(baseDir, name)
+    
+    if (spectra.isEmpty()) return "No spectra to save."
+
+    file.bufferedWriter().use { w ->
+        w.write("wavelength_nm,")
+        w.write(spectra.joinToString(",") { it.label.replace(" ", "_").replace(",", "") })
+        w.write("\n")
+
+        for (i in data.wavelengths.indices) {
+            w.write("${data.wavelengths[i]}")
+            for (spec in spectra) {
+                w.write(",${spec.data[i]}")
+            }
+            w.write("\n")
+        }
+    }
+    return "Saved: ${file.absolutePath}"
 }
