@@ -525,7 +525,7 @@ fun HeatmapCanvas(
             isFakeBoldText = true
         }
 
-        // X Ticks & Labels (Note: Maps new binned coordinates back to original for clarity if binned)
+        // X Ticks & Labels
         for (i in 0..5) {
             val frac = i / 5f
             val xPos = padL + frac * imgW
@@ -678,7 +678,7 @@ fun loadH5FromUri(context: Context, uri: Uri): HsiData {
     } ?: throw IllegalStateException("Cannot open file from picker")
 
     try {
-        var flatCube: FloatArray? = null
+        var finalCube: FloatArray? = null
         var wls: FloatArray? = null
         var newH = 0; var newW = 0; var b = 0
         var origH = 0; var origW = 0
@@ -693,44 +693,54 @@ fun loadH5FromUri(context: Context, uri: Uri): HsiData {
             origW = shape[1].toInt()
             b = shape[2].toInt()
 
-            // AUTO-BINNING LOGIC
-            val rawBytes = origH.toLong() * origW.toLong() * b.toLong() * 4L
-            val maxBytes = 200L * 1024L * 1024L // 200MB safe limit
+            // Read the entire file as a flat array (handles chunked datasets natively)
+            val rawAny = cubeDs.getDataFlat()
+            val flatRaw = when (rawAny) {
+                is FloatArray -> rawAny
+                is DoubleArray -> FloatArray(rawAny.size) { rawAny[it].toFloat() }
+                else -> throw IllegalStateException("cube must be float32 or float64")
+            }
 
+            // AUTO-BINNING LOGIC (in memory)
+            val maxElements = 50_000_000L // ~200MB limit
             spatialBin = 1
-            while ((origH / spatialBin).toLong() * (origW / spatialBin).toLong() * b.toLong() * 4L > maxBytes) {
+            while ((origH / spatialBin).toLong() * (origW / spatialBin).toLong() * b.toLong() > maxElements) {
                 spatialBin++
             }
-            
+
             newH = max(1, origH / spatialBin)
             newW = max(1, origW / spatialBin)
 
-            flatCube = FloatArray(newH * newW * b)
-            val binArea = (spatialBin * spatialBin).toFloat()
+            if (spatialBin == 1) {
+                finalCube = flatRaw
+            } else {
+                val binnedCube = FloatArray(newH * newW * b)
+                val binArea = (spatialBin * spatialBin).toFloat()
 
-            // Read row-by-row to keep memory tiny during the read process
-            for (yOut in 0 until newH) {
-                val offsetY = (yOut * spatialBin).toLong()
-                val offsets = longArrayOf(offsetY, 0, 0)
-                
-                // Read `spatialBin` rows of the original width
-                val chunkData = cubeDs.getData(offsets, intArrayOf(spatialBin, origW, b)) as Array<Array<FloatArray>>
-                
-                for (xOut in 0 until newW) {
-                    val outOffset = (yOut * newW + xOut) * b
-                    for (bIdx in 0 until b) {
-                        var sum = 0f
-                        for (dy in 0 until spatialBin) {
-                            for (dx in 0 until spatialBin) {
-                                val srcX = xOut * spatialBin + dx
-                                if (srcX < origW) {
-                                    sum += chunkData[dy][srcX][bIdx]
+                for (yOut in 0 until newH) {
+                    for (xOut in 0 until newW) {
+                        val outOffset = (yOut * newW + xOut) * b
+                        for (bIdx in 0 until b) {
+                            var sum = 0f
+                            var count = 0
+                            for (dy in 0 until spatialBin) {
+                                val srcY = yOut * spatialBin + dy
+                                if (srcY >= origH) continue
+                                for (dx in 0 until spatialBin) {
+                                    val srcX = xOut * spatialBin + dx
+                                    if (srcX >= origW) continue
+                                    
+                                    val srcOffset = (srcY * origW + srcX) * b + bIdx
+                                    sum += flatRaw[srcOffset]
+                                    count++
                                 }
                             }
+                            binnedCube[outOffset + bIdx] = if (count > 0) sum / count else 0f
                         }
-                        flatCube!![outOffset + bIdx] = sum / binArea
                     }
                 }
+                finalCube = binnedCube
+                System.gc() // Free flatRaw immediately
             }
 
             val wlRaw = wlDs.getDataFlat()
@@ -743,7 +753,7 @@ fun loadH5FromUri(context: Context, uri: Uri): HsiData {
         
         System.gc()
 
-        return HsiData(flatCube!!, wls!!, newH, newW, b, spatialBin, origH, origW)
+        return HsiData(finalCube!!, wls!!, newH, newW, b, spatialBin, origH, origW)
     } catch (e: OutOfMemoryError) {
         throw Exception("File is too large for your phone's RAM even with auto-binning.")
     } finally {
