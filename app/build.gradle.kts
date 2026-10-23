@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("com.chaquo.python")
 }
 
 android {
@@ -13,6 +14,8 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
     }
 
     buildTypes {
@@ -40,7 +43,15 @@ android {
         }
     }
 }
-
+chaquopy {
+    defaultConfig {
+        buildPython("python3")
+        pip {
+            install("numpy")
+            install("h5py")
+        }
+    }
+}
 dependencies {
     implementation("io.jhdf:jhdf:0.8.0")
     implementation(platform("androidx.compose:compose-bom:2024.09.02"))
