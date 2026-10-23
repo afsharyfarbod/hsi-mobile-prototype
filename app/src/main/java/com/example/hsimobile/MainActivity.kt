@@ -24,7 +24,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -39,72 +38,55 @@ import kotlin.math.min
 
 // ---------- Data Classes ----------
 class HsiData(
-    val hdfFile: HdfFile,
-    val cubeDs: Dataset,
+    val flatCube: FloatArray,
     val wavelengths: FloatArray,
     val height: Int,
     val width: Int,
     val bands: Int
 ) {
-    // Memory-efficient reading: loads ONLY the requested band
     fun getBand(bandIndex: Int): FloatArray {
-        val offsets = longArrayOf(0, 0, bandIndex.toLong())
-        val shape = intArrayOf(height, width, 1)
-        val data = cubeDs.getData(offsets, shape) as Array<Array<FloatArray>>
-        val flat = FloatArray(height * width)
-        for (y in 0 until height) {
-            for (x in 0 until width) {
-                flat[y * width + x] = data[y][x][0]
-            }
+        val out = FloatArray(height * width)
+        for (i in 0 until height * width) {
+            out[i] = flatCube[i * bands + bandIndex]
         }
-        return flat
+        return out
     }
 
-    // Loads ONLY a single pixel's spectrum
     fun getPixel(x: Int, y: Int): FloatArray {
-        val offsets = longArrayOf(y.toLong(), x.toLong(), 0)
-        val shape = intArrayOf(1, 1, bands)
-        val data = cubeDs.getData(offsets, shape) as Array<Array<FloatArray>>
-        return data[0][0].clone()
+        val out = FloatArray(bands)
+        val offset = (y * width + x) * bands
+        System.arraycopy(flatCube, offset, out, 0, bands)
+        return out
     }
 
-    // Loads a small ROI and averages it
     fun getRoiAverage(x1: Int, y1: Int, x2: Int, y2: Int): FloatArray {
         val minX = min(x1, x2).coerceIn(0, width - 1)
         val maxX = max(x1, x2).coerceIn(0, width - 1)
         val minY = min(y1, y2).coerceIn(0, height - 1)
         val maxY = max(y1, y2).coerceIn(0, height - 1)
         
-        val w = maxX - minX + 1
-        val h = maxY - minY + 1
-        
-        val offsets = longArrayOf(minY.toLong(), minX.toLong(), 0)
-        val shape = intArrayOf(h, w, bands)
-        val data = cubeDs.getData(offsets, shape) as Array<Array<FloatArray>>
-        
         val avg = FloatArray(bands)
         var count = 0
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val px = data[y][x]
+        for (y in minY..maxY) {
+            for (x in minX..maxX) {
+                val offset = (y * width + x) * bands
                 for (b in 0 until bands) {
-                    avg[b] += px[b]
+                    avg[b] += flatCube[offset + b]
                 }
                 count++
             }
         }
-        for (b in 0 until bands) avg[b] /= count.toFloat()
+        if (count > 0) {
+            for (b in 0 until bands) avg[b] /= count.toFloat()
+        }
         return avg
     }
 
-    // Global sum for visualisation
     fun getGlobalSum(): FloatArray {
         val sum = FloatArray(height * width)
-        // For memory safety, load band by band
-        for (b in 0 until bands) {
-            val band = getBand(b)
-            for (i in band.indices) {
-                sum[i] += band[i]
+        for (i in 0 until height * width) {
+            for (b in 0 until bands) {
+                sum[i] += flatCube[i * bands + b]
             }
         }
         return sum
@@ -116,8 +98,6 @@ data class SpectrumRecord(
     val data: FloatArray,
     val isReference: Boolean = false
 )
-
-data class Pixel(val x: Int, val y: Int)
 
 // ---------- Main Activity ----------
 class MainActivity : ComponentActivity() {
@@ -229,12 +209,10 @@ fun HsiApp() {
                     )
                 } else if (displayMode == "RGB") {
                     Text("R λ: %.0f nm | G λ: %.0f nm | B λ: %.0f nm".format(rWl, gWl, bWl), fontSize = 13.sp)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Column(Modifier.weight(1f)) {
-                            Slider(value = rWl, onValueChange = { rWl = it }, valueRange = data.wavelengths.min()..data.wavelengths.max())
-                            Slider(value = gWl, onValueChange = { gWl = it }, valueRange = data.wavelengths.min()..data.wavelengths.max())
-                            Slider(value = bWl, onValueChange = { bWl = it }, valueRange = data.wavelengths.min()..data.wavelengths.max())
-                        }
+                    Column {
+                        Slider(value = rWl, onValueChange = { rWl = it }, valueRange = data.wavelengths.min()..data.wavelengths.max())
+                        Slider(value = gWl, onValueChange = { gWl = it }, valueRange = data.wavelengths.min()..data.wavelengths.max())
+                        Slider(value = bWl, onValueChange = { bWl = it }, valueRange = data.wavelengths.min()..data.wavelengths.max())
                     }
                 }
 
@@ -325,7 +303,11 @@ fun HeatmapCanvas(
     var dragStart by remember { mutableStateOf<Offset?>(null) }
     var dragEnd by remember { mutableStateOf<Offset?>(null) }
 
-    // Cache the visual data to prevent re-reading on every frame
+    val padLeft = 50.dp
+    val padBottom = 40.dp
+    val padTop = 10.dp
+    val padRight = 10.dp
+
     val visualData = remember(data, displayMode, band, rWl, gWl, bWl) {
         when (displayMode) {
             "Single Band" -> data.getBand(band)
@@ -337,7 +319,6 @@ fun HeatmapCanvas(
                 val r = data.getBand(rIdx)
                 val g = data.getBand(gIdx)
                 val b = data.getBand(bIdx)
-                // Return RGB as a giant FloatArray where every 3 values are R,G,B
                 val rgb = FloatArray(r.size * 3)
                 for (i in r.indices) {
                     rgb[i * 3] = r[i]
@@ -359,37 +340,47 @@ fun HeatmapCanvas(
         }
         if (max - min < 1e-8f) min to (min + 1f) else min to max
     }
-    
     val span = (mx - mn).coerceAtLeast(1e-6f)
 
     Canvas(
         modifier = Modifier
             .fillMaxWidth()
-            .aspectRatio(data.width.toFloat() / data.height.toFloat())
-            .background(Color.LightGray.copy(alpha = 0.3f))
+            .height(350.dp) // Fixed height for good visibility
+            .background(Color.White)
             .pointerInput(data, selectionMode, visualData) {
-                val cw = size.width.toFloat()
-                val ch = size.height.toFloat()
+                val padL = padLeft.toPx()
+                val padB = padBottom.toPx()
+                val padT = padTop.toPx()
+                val padR = padRight.toPx()
                 
+                val imgW = size.width - padL - padR
+                val imgH = size.height - padT - padB
+
                 if (selectionMode == "Single Pixel") {
                     detectTapGestures { offset ->
-                        val px = (offset.x / cw * data.width).toInt().coerceIn(0, data.width - 1)
-                        val py = (offset.y / ch * data.height).toInt().coerceIn(0, data.height - 1)
+                        if (offset.x < padL || offset.x > padL + imgW || offset.y < padT || offset.y > padT + imgH) return@detectTapGestures
+                        val px = ((offset.x - padL) / imgW * data.width).toInt().coerceIn(0, data.width - 1)
+                        val py = ((offset.y - padT) / imgH * data.height).toInt().coerceIn(0, data.height - 1)
                         val spec = data.getPixel(px, py)
                         onExtractSpectrum("Pixel ($px, $py)", spec)
                     }
                 } else {
                     detectDragGestures(
-                        onDragStart = { dragStart = it; dragEnd = it },
+                        onDragStart = { 
+                            if (it.x >= padL && it.x <= padL + imgW && it.y >= padT && it.y <= padT + imgH) {
+                                dragStart = it
+                                dragEnd = it
+                            }
+                        },
                         onDrag = { change, _ -> change.consume(); dragEnd = change.position },
                         onDragEnd = {
                             val start = dragStart
                             val end = dragEnd
                             if (start != null && end != null) {
-                                val x1 = (start.x / cw * data.width).toInt().coerceIn(0, data.width - 1)
-                                val y1 = (start.y / ch * data.height).toInt().coerceIn(0, data.height - 1)
-                                val x2 = (end.x / cw * data.width).toInt().coerceIn(0, data.width - 1)
-                                val y2 = (end.y / ch * data.height).toInt().coerceIn(0, data.height - 1)
+                                val x1 = ((start.x - padL) / imgW * data.width).toInt().coerceIn(0, data.width - 1)
+                                val y1 = ((start.y - padT) / imgH * data.height).toInt().coerceIn(0, data.height - 1)
+                                val x2 = ((end.x - padL) / imgW * data.width).toInt().coerceIn(0, data.width - 1)
+                                val y2 = ((end.y - padT) / imgH * data.height).toInt().coerceIn(0, data.height - 1)
                                 val spec = data.getRoiAverage(x1, y1, x2, y2)
                                 onExtractSpectrum("ROI ($x1-$x2, $y1-$y2)", spec)
                             }
@@ -400,8 +391,16 @@ fun HeatmapCanvas(
                 }
             }
     ) {
-        val cellW = size.width / data.width
-        val cellH = size.height / data.height
+        val padL = padLeft.toPx()
+        val padB = padBottom.toPx()
+        val padT = padTop.toPx()
+        val padR = padRight.toPx()
+
+        val imgW = size.width - padL - padR
+        val imgH = size.height - padT - padB
+
+        val cellW = imgW / data.width
+        val cellH = imgH / data.height
 
         // 1. Draw Image
         for (y in 0 until data.height) {
@@ -414,14 +413,14 @@ fun HeatmapCanvas(
                             (visualData[idx + 1] - mn) / span,
                             (visualData[idx + 2] - mn) / span
                         ),
-                        topLeft = Offset(x * cellW, y * cellH),
+                        topLeft = Offset(padL + x * cellW, padT + y * cellH),
                         size = Size(cellW + 1f, cellH + 1f)
                     )
                 } else {
                     val v = (visualData[y * data.width + x] - mn) / span
                     drawRect(
                         color = jetColor(v),
-                        topLeft = Offset(x * cellW, y * cellH),
+                        topLeft = Offset(padL + x * cellW, padT + y * cellH),
                         size = Size(cellW + 1f, cellH + 1f)
                     )
                 }
@@ -436,7 +435,35 @@ fun HeatmapCanvas(
         }
 
         // 3. Draw Axes
-        drawAxes(data.width.toFloat(), data.height.toFloat(), cellW, cellH)
+        drawLine(Color.Black, Offset(padL, padT), Offset(padL, padT + imgH), strokeWidth = 2f)
+        drawLine(Color.Black, Offset(padL, padT + imgH), Offset(padL + imgW, padT + imgH), strokeWidth = 2f)
+
+        val paint = android.graphics.Paint().apply {
+            color = android.graphics.Color.BLACK
+            textSize = 30f
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+        val paintY = android.graphics.Paint(paint).apply {
+            textAlign = android.graphics.Paint.Align.RIGHT
+        }
+
+        // X Labels
+        for (i in 0..5) {
+            val frac = i / 5f
+            val xPos = padL + frac * imgW
+            val valX = (frac * data.width).toInt()
+            drawLine(Color.Black, Offset(xPos, padT + imgH), Offset(xPos, padT + imgH + 10f), strokeWidth = 2f)
+            drawContext.canvas.nativeCanvas.drawText("$valX", xPos, padT + imgH + 40f, paint)
+        }
+
+        // Y Labels (inverted so 0 is at top)
+        for (i in 0..5) {
+            val frac = i / 5f
+            val yPos = padT + imgH - frac * imgH
+            val valY = (frac * data.height).toInt()
+            drawLine(Color.Black, Offset(padL, yPos), Offset(padL - 10f, yPos), strokeWidth = 2f)
+            drawContext.canvas.nativeCanvas.drawText("$valY", padL - 15f, yPos + 10f, paintY)
+        }
     }
 }
 
@@ -458,14 +485,13 @@ fun SpectrumCanvas(data: HsiData, spectra: List<SpectrumRecord>) {
         if (spectra.isEmpty()) 0f to 1f else (mn to mx)
     }
     val spanInt = (maxInt - minInt).coerceAtLeast(1e-6f)
-    
-    // Map to add padding for axes
-    val padLeft = 60.dp.value
-    val padBottom = 40.dp.value
-    val padTop = 20.dp.value
-    val padRight = 20.dp.value
 
-    Canvas(modifier = Modifier.fillMaxWidth().height(250.dp)) {
+    Canvas(modifier = Modifier.fillMaxWidth().height(250.dp).background(Color.White)) {
+        val padLeft = 60.dp.toPx()
+        val padBottom = 40.dp.toPx()
+        val padTop = 20.dp.toPx()
+        val padRight = 20.dp.toPx()
+
         val w = size.width - padLeft - padRight
         val h = size.height - padTop - padBottom
 
@@ -518,10 +544,6 @@ fun SpectrumCanvas(data: HsiData, spectra: List<SpectrumRecord>) {
     }
 }
 
-fun drawAxes(dataW: Float, dataH: Float, cellW: Float, cellH: Float) {
-    // Logic for heatmap axes is drawn in the main Canvas block if needed
-}
-
 fun findClosestBand(wls: FloatArray, target: Float): Int {
     var best = 0
     var minDiff = Float.MAX_VALUE
@@ -561,24 +583,36 @@ fun loadH5FromUri(context: Context, uri: Uri): HsiData {
         tmp.outputStream().use { output -> input.copyTo(output) }
     } ?: throw IllegalStateException("Cannot open file from picker")
 
-    // We do NOT delete the temp file immediately. We keep it alive so Lazy Loading works.
-    val hdf = HdfFile(tmp.toPath())
-    val cubeDs = findDataset(hdf, "cube")
-    val wlDs = findDataset(hdf, "wavelengths")
+    try {
+        HdfFile(tmp.toPath()).use { hdf ->
+            val cubeDs = findDataset(hdf, "cube")
+            val wlDs = findDataset(hdf, "wavelengths")
 
-    val shape = cubeDs.getDimensions()
-    val h = shape[0]
-    val w = shape[1]
-    val b = shape[2]
+            val shape = cubeDs.getDimensions()
+            val h = shape[0]
+            val w = shape[1]
+            val b = shape[2]
 
-    val wlRaw = wlDs.data
-    val wls = when (wlRaw) {
-        is FloatArray -> wlRaw
-        is DoubleArray -> FloatArray(wlRaw.size) { wlRaw[it].toFloat() }
-        else -> throw IllegalStateException("wavelengths must be 1D float")
+            // Use getDataFlat() to read as a primitive array to avoid OutOfMemoryError
+            val flatRaw = cubeDs.getDataFlat()
+            val flatCube = when (flatRaw) {
+                is FloatArray -> flatRaw
+                is DoubleArray -> FloatArray(flatRaw.size) { flatRaw[it].toFloat() }
+                else -> throw IllegalStateException("cube must be float32 or float64")
+            }
+
+            val wlRaw = wlDs.getDataFlat()
+            val wls = when (wlRaw) {
+                is FloatArray -> wlRaw
+                is DoubleArray -> FloatArray(wlRaw.size) { wlRaw[it].toFloat() }
+                else -> throw IllegalStateException("wavelengths must be 1D float")
+            }
+
+            return HsiData(flatCube, wls, h, w, b)
+        }
+    } finally {
+        tmp.delete() // The data is now in RAM, so we safely delete the temp file
     }
-
-    return HsiData(hdf, cubeDs, wls, h, w, b)
 }
 
 fun saveCsv(context: Context, data: HsiData, spectra: List<SpectrumRecord>): String {
@@ -589,12 +623,10 @@ fun saveCsv(context: Context, data: HsiData, spectra: List<SpectrumRecord>): Str
     if (spectra.isEmpty()) return "No spectra to save."
 
     file.bufferedWriter().use { w ->
-        // Header
         w.write("wavelength_nm,")
         w.write(spectra.joinToString(",") { it.label })
         w.write("\n")
 
-        // Data rows
         for (i in data.wavelengths.indices) {
             w.write("${data.wavelengths[i]}")
             for (spec in spectra) {
