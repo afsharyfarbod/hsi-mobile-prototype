@@ -12,8 +12,16 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,6 +41,7 @@ import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import io.jhdf.HdfFile
 import io.jhdf.api.Dataset
+import kotlinx.coroutines.launch
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.max
@@ -117,13 +126,17 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // INITIALIZE PYTHON
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(this))
         }
 
         setContent {
-            MaterialTheme {
+            MaterialTheme(
+                colorScheme = lightColorScheme(
+                    primary = Color(0xFF2E7D32), // Nice HSI green
+                    secondary = Color(0xFF1565C0)
+                )
+            ) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     HsiApp()
                 }
@@ -136,9 +149,13 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun HsiApp() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val bottomSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    
     var hsi by remember { mutableStateOf<HsiData?>(null) }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var showSheet by remember { mutableStateOf(false) }
     
     var displayMode by remember { mutableStateOf("Single Band") }
     var selectedBand by remember { mutableIntStateOf(0) }
@@ -151,7 +168,7 @@ fun HsiApp() {
     var spectra by remember { mutableStateOf<List<SpectrumRecord>>(emptyList()) }
     var activeCsvMsg by remember { mutableStateOf<String?>(null) }
 
-    val palette = listOf(Color.Blue, Color.Red, Color.Green, Color.Magenta, Color.Cyan, Color(0xFFFFA500))
+    val palette = listOf(Color.Blue, Color.Red, Color(0xFF00C853), Color.Magenta, Color.Cyan, Color(0xFFFFA500))
 
     val picker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -180,162 +197,201 @@ fun HsiApp() {
     }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("HSI Mobile", fontWeight = FontWeight.Bold) }) }
+        topBar = {
+            TopAppBar(
+                title = { Text("CHIMERA HSI", fontWeight = FontWeight.Bold) },
+                actions = {
+                    if (hsi != null) {
+                        IconButton(onClick = { 
+                            val msg = saveCsv(context, hsi!!, spectra)
+                            activeCsvMsg = msg
+                        }) {
+                            Icon(Icons.Default.Save, contentDescription = "Save CSV")
+                        }
+                        IconButton(onClick = { 
+                            shapes = emptyList()
+                            spectra = emptyList()
+                        }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Clear All")
+                        }
+                    }
+                    IconButton(onClick = { showSheet = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = "Settings")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            )
+        }
     ) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState())
+                .background(Color(0xFFF5F5F5))
         ) {
-            Button(
-                onClick = { picker.launch(arrayOf("*/*")) },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !loading
-            ) {
-                Text(if (loading) "Processing (Auto-binning)..." else "Select .h5 File")
-            }
-
-            error?.let {
-                Spacer(Modifier.height(8.dp))
-                Text("Error: $it", color = Color.Red, fontSize = 13.sp)
-            }
-
-            hsi?.let { data ->
-                Spacer(Modifier.height(8.dp))
-                
-                if (data.spatialBin > 1) {
-                    Text(
-                        "⚠️ Auto-binned ${data.spatialBin}×${data.spatialBin} on-device. (Original: ${data.origHeight}×${data.origWidth} → New: ${data.height}×${data.width})",
-                        color = Color(0xFFD32F2F), fontSize = 12.sp
-                    )
-                }
-
-                Spacer(Modifier.height(16.dp))
-                
-                Text("Display Mode", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    listOf("Single Band", "Global Sum", "RGB").forEach { mode ->
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            RadioButton(
-                                selected = displayMode == mode,
-                                onClick = { displayMode = mode }
-                            )
-                            Text(mode, fontSize = 13.sp)
-                            Spacer(Modifier.width(4.dp))
+            if (hsi == null) {
+                // Empty State
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("No Data Loaded", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
+                        Spacer(Modifier.height(16.dp))
+                        Button(
+                            onClick = { picker.launch(arrayOf("*/*")) },
+                            enabled = !loading
+                        ) {
+                            Text(if (loading) "Processing (Auto-binning)..." else "Select .h5 File")
                         }
                     }
                 }
+            } else {
+                val data = hsi!!
+                
+                // Loading / Warning Banner
+                if (loading) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                if (data.spatialBin > 1) {
+                    Surface(color = Color(0xFFFFCDD2), modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            "Auto-binned ${data.spatialBin}x${data.spatialBin} (${data.origWidth}x${data.origHeight} → ${data.width}x${data.height})",
+                            modifier = Modifier.padding(8.dp),
+                            color = Color(0xFFB71C1C), fontSize = 12.sp,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                    }
+                }
+                error?.let {
+                    Text(it, color = Color.Red, modifier = Modifier.padding(8.dp))
+                }
 
+                // --- Split View ---
+                // Top: Heatmap (60% of remaining screen)
+                Box(modifier = Modifier.weight(1.2f).fillMaxWidth().padding(8.dp)) {
+                    HeatmapCanvas(
+                        data = data,
+                        displayMode = displayMode,
+                        band = selectedBand,
+                        rWl = rWl, gWl = gWl, bWl = bWl,
+                        selectionMode = selectionMode,
+                        shapes = shapes,
+                        onExtractSpectrum = { type, x1, y1, x2, y2, spec ->
+                            val nextNum = shapes.size + 1
+                            shapes = shapes + DrawnShape(type, x1, y1, x2, y2, nextNum)
+                            val label = if (type == "point") "P$nextNum" else "ROI $nextNum"
+                            val col = palette[(nextNum - 1) % palette.size]
+                            spectra = spectra + SpectrumRecord(label, spec, col, false)
+                        }
+                    )
+                }
+
+                // Bottom: Spectrum & Legend (40% of remaining screen)
+                Card(
+                    modifier = Modifier.weight(0.9f).fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
+                        Text("Spectra Viewer", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        
+                        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                            SpectrumCanvas(data = data, spectra = spectra)
+                        }
+                        
+                        // Horizontal Scrollable Legend
+                        if (spectra.isNotEmpty()) {
+                            LazyRow(
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                items(spectra) { rec ->
+                                    Surface(
+                                        color = rec.color.copy(alpha = 0.15f),
+                                        shape = RoundedCornerShape(16.dp),
+                                        border = androidx.compose.foundation.BorderStroke(1.dp, rec.color)
+                                    ) {
+                                        Text(
+                                            rec.label,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                            fontSize = 12.sp, color = Color.Black
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if (activeCsvMsg != null) {
+                    Text(activeCsvMsg!!, color = Color(0xFF2E7D32), fontSize = 12.sp, modifier = Modifier.padding(8.dp))
+                }
+            }
+        }
+    }
+
+    // --- Bottom Sheet for Controls ---
+    if (showSheet && hsi != null) {
+        ModalBottomSheet(
+            onDismissRequest = { showSheet = false },
+            sheetState = bottomSheetState
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(16.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text("Display Settings", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                
+                // Display Mode
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Single Band", "Global Sum", "RGB").forEach { mode ->
+                        FilterChip(
+                            selected = displayMode == mode,
+                            onClick = { displayMode = mode },
+                            label = { Text(mode) }
+                        )
+                    }
+                }
+
+                // Conditional Sliders
                 if (displayMode == "Single Band") {
-                    Text("Band ${selectedBand + 1} / ${data.bands}   λ = %.1f nm".format(data.wavelengths[selectedBand]), fontSize = 13.sp)
+                    Text("Band ${selectedBand + 1} / ${hsi!!.bands}   λ = %.1f nm".format(hsi!!.wavelengths[selectedBand]))
                     Slider(
                         value = selectedBand.toFloat(),
-                        onValueChange = { selectedBand = it.toInt().coerceIn(0, data.bands - 1) },
-                        valueRange = 0f..(data.bands - 1).toFloat().coerceAtLeast(1f),
-                        steps = if (data.bands > 2) data.bands - 2 else 0
+                        onValueChange = { selectedBand = it.toInt().coerceIn(0, hsi!!.bands - 1) },
+                        valueRange = 0f..(hsi!!.bands - 1).toFloat().coerceAtLeast(1f),
+                        steps = if (hsi!!.bands > 2) hsi!!.bands - 2 else 0
                     )
                 } else if (displayMode == "RGB") {
-                    Text("R λ: %.0f nm | G λ: %.0f nm | B λ: %.0f nm".format(rWl, gWl, bWl), fontSize = 13.sp)
-                    Column {
-                        Slider(value = rWl, onValueChange = { rWl = it }, valueRange = data.wavelengths.min()..data.wavelengths.max())
-                        Slider(value = gWl, onValueChange = { gWl = it }, valueRange = data.wavelengths.min()..data.wavelengths.max())
-                        Slider(value = bWl, onValueChange = { bWl = it }, valueRange = data.wavelengths.min()..data.wavelengths.max())
+                    Text("Red λ: %.0f nm".format(rWl))
+                    Slider(value = rWl, onValueChange = { rWl = it }, valueRange = hsi!!.wavelengths.min()..hsi!!.wavelengths.max())
+                    Text("Green λ: %.0f nm".format(gWl))
+                    Slider(value = gWl, onValueChange = { gWl = it }, valueRange = hsi!!.wavelengths.min()..hsi!!.wavelengths.max())
+                    Text("Blue λ: %.0f nm".format(bWl))
+                    Slider(value = bWl, onValueChange = { bWl = it }, valueRange = hsi!!.wavelengths.min()..hsi!!.wavelengths.max())
+                }
+
+                Divider()
+
+                Text("Selection Mode", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Single Pixel", "Rectangle ROI").forEach { mode ->
+                        FilterChip(
+                            selected = selectionMode == mode,
+                            onClick = { selectionMode = mode },
+                            label = { Text(mode) }
+                        )
                     }
                 }
 
-                Spacer(Modifier.height(16.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        listOf("Single Pixel", "Rectangle ROI").forEach { mode ->
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                RadioButton(
-                                    selected = selectionMode == mode,
-                                    onClick = { selectionMode = mode }
-                                )
-                                Text(mode, fontSize = 13.sp)
-                                Spacer(Modifier.width(4.dp))
-                            }
-                        }
-                    }
-                    if (shapes.isNotEmpty()) {
-                        TextButton(onClick = { 
-                            shapes = emptyList()
-                            spectra = emptyList()
-                        }) { Text("Clear", color = Color.Red) }
-                    }
-                }
-                
-                HeatmapCanvas(
-                    data = data,
-                    displayMode = displayMode,
-                    band = selectedBand,
-                    rWl = rWl, gWl = gWl, bWl = bWl,
-                    selectionMode = selectionMode,
-                    shapes = shapes,
-                    onExtractSpectrum = { type, x1, y1, x2, y2, spec ->
-                        val nextNum = shapes.size + 1
-                        shapes = shapes + DrawnShape(type, x1, y1, x2, y2, nextNum)
-                        val label = if (type == "point") "Pixel $nextNum ($x1, $y1)" else "ROI $nextNum ($x1-$x2, $y1-$y2)"
-                        val col = palette[(nextNum - 1) % palette.size]
-                        spectra = spectra + SpectrumRecord(label, spec, col, false)
-                    }
-                )
-
-                if (spectra.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Button(onClick = {
-                            val last = spectra.last()
-                            spectra = spectra.dropLast(1) + last.copy(isReference = true, color = Color.Black)
-                        }) { Text("Pin Last as Ref") }
-                        
-                        Button(onClick = { activeCsvMsg = saveCsv(context, data, spectra) }) { 
-                            Text("Save CSV") 
-                        }
-                    }
-                    activeCsvMsg?.let { Text(it, fontSize = 12.sp, color = Color(0xFF388E3C)) }
-                }
-
-                Spacer(Modifier.height(16.dp))
-
-                Text("Spectra Viewer", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                SpectrumCanvas(data = data, spectra = spectra)
-                
-                if (spectra.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
-                    FlowRow(modifier = Modifier.fillMaxWidth()) {
-                        spectra.forEach { rec ->
-                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(end = 12.dp, bottom = 4.dp)) {
-                                Box(modifier = Modifier.size(12.dp).background(rec.color))
-                                Spacer(Modifier.width(4.dp))
-                                Text(rec.label, fontSize = 11.sp)
-                            }
-                        }
-                    }
-                }
-
-            } ?: run {
-                if (!loading) {
-                    Spacer(Modifier.height(24.dp))
-                    Text(
-                        "Tap 'Select .h5 File' to load a hyperspectral cube.",
-                        fontSize = 13.sp
-                    )
-                }
+                Spacer(Modifier.height(24.dp))
             }
         }
     }
 }
 
+// ---------- Canvas & Drawing Functions ----------
 @Composable
 fun HeatmapCanvas(
     data: HsiData,
@@ -349,10 +405,10 @@ fun HeatmapCanvas(
     var dragStart by remember { mutableStateOf<Offset?>(null) }
     var dragEnd by remember { mutableStateOf<Offset?>(null) }
 
-    val padLeft = 55.dp
-    val padBottom = 50.dp
-    val padTop = 15.dp
-    val padRight = 15.dp
+    val padLeft = 45.dp
+    val padBottom = 40.dp
+    val padTop = 10.dp
+    val padRight = 10.dp
 
     val visualData = remember(data, displayMode, band, rWl, gWl, bWl) {
         when (displayMode) {
@@ -390,9 +446,8 @@ fun HeatmapCanvas(
 
     Canvas(
         modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(data.width.toFloat() / data.height.toFloat())
-            .background(Color.White)
+            .fillMaxSize()
+            .background(Color.White, RoundedCornerShape(8.dp))
             .pointerInput(data, selectionMode, visualData) {
                 val padL = padLeft.toPx()
                 val padB = padBottom.toPx()
@@ -474,7 +529,7 @@ fun HeatmapCanvas(
 
         val textPaint = android.graphics.Paint().apply {
             color = android.graphics.Color.WHITE
-            textSize = 35f
+            textSize = 30f
             textAlign = android.graphics.Paint.Align.CENTER
             setShadowLayer(4f, 0f, 0f, android.graphics.Color.BLACK)
         }
@@ -483,38 +538,39 @@ fun HeatmapCanvas(
             if (shape.type == "point") {
                 val cx = padL + (shape.x1 + 0.5f) * cellW
                 val cy = padT + (shape.y1 + 0.5f) * cellH
-                drawCircle(Color.Red, radius = 12f, center = Offset(cx, cy))
-                drawCircle(Color.White, radius = 12f, center = Offset(cx, cy), style = Stroke(width = 3f))
-                drawContext.canvas.nativeCanvas.drawText("${shape.number}", cx, cy + 12f, textPaint)
+                drawCircle(Color.Red, radius = 10f, center = Offset(cx, cy))
+                drawCircle(Color.White, radius = 10f, center = Offset(cx, cy), style = Stroke(width = 2f))
+                drawContext.canvas.nativeCanvas.drawText("${shape.number}", cx, cy + 10f, textPaint)
             } else {
                 val left = padL + shape.x1 * cellW
                 val top = padT + shape.y1 * cellH
                 val rw = (shape.x2 - shape.x1 + 1) * cellW
                 val rh = (shape.y2 - shape.y1 + 1) * cellH
-                drawRect(Color.Red, topLeft = Offset(left, top), size = Size(rw, rh), style = Stroke(width = 4f))
-                drawContext.canvas.nativeCanvas.drawText("${shape.number}", left + rw/2, top + rh/2 + 12f, textPaint)
+                drawRect(Color.Red, topLeft = Offset(left, top), size = Size(rw, rh), style = Stroke(width = 3f))
+                drawContext.canvas.nativeCanvas.drawText("${shape.number}", left + rw/2, top + rh/2 + 10f, textPaint)
             }
         }
 
         if (dragStart != null && dragEnd != null && selectionMode == "Rectangle ROI") {
             val topLeft = Offset(min(dragStart!!.x, dragEnd!!.x), min(dragStart!!.y, dragEnd!!.y))
             val size = Size(abs(dragStart!!.x - dragEnd!!.x), abs(dragStart!!.y - dragEnd!!.y))
-            drawRect(Color.Yellow, topLeft, size, style = Stroke(width = 3f))
+            drawRect(Color.Yellow, topLeft, size, style = Stroke(width = 2f))
         }
 
-        drawLine(Color.Black, Offset(padL, padT), Offset(padL, padT + imgH), strokeWidth = 3f)
-        drawLine(Color.Black, Offset(padL, padT + imgH), Offset(padL + imgW, padT + imgH), strokeWidth = 3f)
+        // Draw Axes
+        drawLine(Color.Black, Offset(padL, padT), Offset(padL, padT + imgH), strokeWidth = 2f)
+        drawLine(Color.Black, Offset(padL, padT + imgH), Offset(padL + imgW, padT + imgH), strokeWidth = 2f)
 
         val textPaintAxes = android.graphics.Paint().apply {
             color = android.graphics.Color.BLACK
-            textSize = 30f
+            textSize = 24f
             textAlign = android.graphics.Paint.Align.CENTER
         }
         val textPaintY = android.graphics.Paint(textPaintAxes).apply {
             textAlign = android.graphics.Paint.Align.RIGHT
         }
         val titlePaint = android.graphics.Paint(textPaintAxes).apply {
-            textSize = 35f
+            textSize = 28f
             isFakeBoldText = true
         }
 
@@ -522,21 +578,21 @@ fun HeatmapCanvas(
             val frac = i / 5f
             val xPos = padL + frac * imgW
             val valX = (frac * data.origWidth).toInt()
-            drawLine(Color.Black, Offset(xPos, padT + imgH), Offset(xPos, padT + imgH + 10f), strokeWidth = 2f)
-            drawContext.canvas.nativeCanvas.drawText("$valX", xPos, padT + imgH + 40f, textPaintAxes)
+            drawLine(Color.Black, Offset(xPos, padT + imgH), Offset(xPos, padT + imgH + 5f), strokeWidth = 1f)
+            drawContext.canvas.nativeCanvas.drawText("$valX", xPos, padT + imgH + 25f, textPaintAxes)
         }
-        drawContext.canvas.nativeCanvas.drawText("X (px)", padL + imgW/2, size.height - 5f, titlePaint)
+        drawContext.canvas.nativeCanvas.drawText("X (px)", padL + imgW/2, size.height - 2f, titlePaint)
 
         for (i in 0..5) {
             val frac = i / 5f
             val yPos = padT + imgH - frac * imgH
             val valY = (frac * data.origHeight).toInt()
-            drawLine(Color.Black, Offset(padL, yPos), Offset(padL - 10f, yPos), strokeWidth = 2f)
-            drawContext.canvas.nativeCanvas.drawText("$valY", padL - 15f, yPos + 10f, textPaintY)
+            drawLine(Color.Black, Offset(padL, yPos), Offset(padL - 5f, yPos), strokeWidth = 1f)
+            drawContext.canvas.nativeCanvas.drawText("$valY", padL - 8f, yPos + 8f, textPaintY)
         }
         drawContext.canvas.nativeCanvas.save()
-        drawContext.canvas.nativeCanvas.rotate(-90f, 15f, padT + imgH/2)
-        drawContext.canvas.nativeCanvas.drawText("Y (px)", 15f, padT + imgH/2, titlePaint)
+        drawContext.canvas.nativeCanvas.rotate(-90f, 10f, padT + imgH/2)
+        drawContext.canvas.nativeCanvas.drawText("Y (px)", 10f, padT + imgH/2, titlePaint)
         drawContext.canvas.nativeCanvas.restore()
     }
 }
@@ -560,17 +616,17 @@ fun SpectrumCanvas(data: HsiData, spectra: List<SpectrumRecord>) {
     }
     val spanInt = (maxInt - minInt).coerceAtLeast(1e-6f)
 
-    Canvas(modifier = Modifier.fillMaxWidth().height(300.dp).background(Color.White)) {
-        val padLeft = 70.dp.toPx()
-        val padBottom = 70.dp.toPx()
-        val padTop = 20.dp.toPx()
-        val padRight = 20.dp.toPx()
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val padLeft = 50.dp.toPx()
+        val padBottom = 40.dp.toPx()
+        val padTop = 10.dp.toPx()
+        val padRight = 10.dp.toPx()
 
         val w = size.width - padLeft - padRight
         val h = size.height - padTop - padBottom
 
-        drawLine(Color.Black, Offset(padLeft, padTop), Offset(padLeft, padTop + h), strokeWidth = 3f)
-        drawLine(Color.Black, Offset(padLeft, padTop + h), Offset(padLeft + w, padTop + h), strokeWidth = 3f)
+        drawLine(Color.Black, Offset(padLeft, padTop), Offset(padLeft, padTop + h), strokeWidth = 2f)
+        drawLine(Color.Black, Offset(padLeft, padTop + h), Offset(padLeft + w, padTop + h), strokeWidth = 2f)
 
         spectra.forEach { rec ->
             val path = Path()
@@ -586,14 +642,14 @@ fun SpectrumCanvas(data: HsiData, spectra: List<SpectrumRecord>) {
 
         val textPaint = android.graphics.Paint().apply {
             color = android.graphics.Color.BLACK
-            textSize = 30f
+            textSize = 24f
             textAlign = android.graphics.Paint.Align.CENTER
         }
         val textPaintY = android.graphics.Paint(textPaint).apply {
             textAlign = android.graphics.Paint.Align.RIGHT
         }
         val titlePaint = android.graphics.Paint(textPaint).apply {
-            textSize = 35f
+            textSize = 28f
             isFakeBoldText = true
         }
 
@@ -601,24 +657,26 @@ fun SpectrumCanvas(data: HsiData, spectra: List<SpectrumRecord>) {
             val frac = i / 4f
             val xPos = padLeft + frac * w
             val valX = minWl + frac * spanWl
-            drawLine(Color.Black, Offset(xPos, padTop + h), Offset(xPos, padTop + h + 10f), strokeWidth = 2f)
-            drawContext.canvas.nativeCanvas.drawText("%.0f".format(valX), xPos, padTop + h + 40f, textPaint)
+            drawLine(Color.Black, Offset(xPos, padTop + h), Offset(xPos, padTop + h + 5f), strokeWidth = 1f)
+            drawContext.canvas.nativeCanvas.drawText("%.0f".format(valX), xPos, padTop + h + 25f, textPaint)
         }
-        drawContext.canvas.nativeCanvas.drawText("Wavelength (nm)", padLeft + w/2, size.height - 10f, titlePaint)
+        drawContext.canvas.nativeCanvas.drawText("Wavelength (nm)", padLeft + w/2, size.height - 2f, titlePaint)
 
         for (i in 0..4) {
             val frac = i / 4f
             val yPos = padTop + h - frac * h
             val valY = minInt + frac * spanInt
-            drawLine(Color.Black, Offset(padLeft, yPos), Offset(padLeft - 10f, yPos), strokeWidth = 2f)
-            drawContext.canvas.nativeCanvas.drawText("%.2f".format(valY), padLeft - 15f, yPos + 10f, textPaintY)
+            drawLine(Color.Black, Offset(padLeft, yPos), Offset(padLeft - 5f, yPos), strokeWidth = 1f)
+            drawContext.canvas.nativeCanvas.drawText("%.2f".format(valY), padLeft - 8f, yPos + 8f, textPaintY)
         }
         drawContext.canvas.nativeCanvas.save()
-        drawContext.canvas.nativeCanvas.rotate(-90f, 20f, padTop + h/2)
-        drawContext.canvas.nativeCanvas.drawText("Intensity", 20f, padTop + h/2, titlePaint)
+        drawContext.canvas.nativeCanvas.rotate(-90f, 10f, padTop + h/2)
+        drawContext.canvas.nativeCanvas.drawText("Intensity", 10f, padTop + h/2, titlePaint)
         drawContext.canvas.nativeCanvas.restore()
     }
 }
+
+// ... (Keep the rest of the helper functions exactly the same: findClosestBand, jetColor, findDataset, loadH5WithPython, saveCsv) ...
 
 fun findClosestBand(wls: FloatArray, target: Float): Int {
     var best = 0
