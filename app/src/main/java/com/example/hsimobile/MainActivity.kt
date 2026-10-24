@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -132,7 +133,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(
                 colorScheme = lightColorScheme(
-                    primary = Color(0xFF2E7D32), // Nice HSI green
+                    primary = Color(0xFF2E7D32),
                     secondary = Color(0xFF1565C0)
                 )
             ) {
@@ -156,13 +157,14 @@ fun HsiApp() {
     var error by remember { mutableStateOf<String?>(null) }
     var showSheet by remember { mutableStateOf(false) }
     
-    var displayMode by remember { mutableStateOf("Single Band") }
-    var selectedBand by remember { mutableIntStateOf(0) }
-    var rWl by remember { mutableFloatStateOf(650f) }
-    var gWl by remember { mutableFloatStateOf(550f) }
-    var bWl by remember { mutableFloatStateOf(450f) }
-
-    var selectionMode by remember { mutableStateOf("Single Pixel") }
+    // Saveable states survive rotation
+    var displayMode by rememberSaveable { mutableStateOf("Single Band") }
+    var selectedBand by rememberSaveable { mutableIntStateOf(0) }
+    var rWl by rememberSaveable { mutableFloatStateOf(650f) }
+    var gWl by rememberSaveable { mutableFloatStateOf(550f) }
+    var bWl by rememberSaveable { mutableFloatStateOf(450f) }
+    var selectionMode by rememberSaveable { mutableStateOf("Single Pixel") }
+    
     var shapes by remember { mutableStateOf<List<DrawnShape>>(emptyList()) }
     var spectra by remember { mutableStateOf<List<SpectrumRecord>>(emptyList()) }
     var activeCsvMsg by remember { mutableStateOf<String?>(null) }
@@ -232,7 +234,6 @@ fun HsiApp() {
                 .background(Color(0xFFF5F5F5))
         ) {
             if (hsi == null) {
-                // Empty State
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("No Data Loaded", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
@@ -248,7 +249,6 @@ fun HsiApp() {
             } else {
                 val data = hsi!!
                 
-                // Loading / Warning Banner
                 if (loading) {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
@@ -266,8 +266,6 @@ fun HsiApp() {
                     Text(it, color = Color.Red, modifier = Modifier.padding(8.dp))
                 }
 
-                // --- Split View ---
-                // Top: Heatmap (60% of remaining screen)
                 Box(modifier = Modifier.weight(1.2f).fillMaxWidth().padding(8.dp)) {
                     HeatmapCanvas(
                         data = data,
@@ -286,20 +284,18 @@ fun HsiApp() {
                     )
                 }
 
-                // Bottom: Spectrum & Legend (40% of remaining screen)
                 Card(
                     modifier = Modifier.weight(0.9f).fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                     elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
                     shape = RoundedCornerShape(12.dp)
                 ) {
                     Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
-                        Text("Spectra Viewer", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Text("Spectra Viewer (Tap to inspect)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                         
                         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                             SpectrumCanvas(data = data, spectra = spectra)
                         }
                         
-                        // Horizontal Scrollable Legend
                         if (spectra.isNotEmpty()) {
                             LazyRow(
                                 modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
@@ -330,7 +326,6 @@ fun HsiApp() {
         }
     }
 
-    // --- Bottom Sheet for Controls ---
     if (showSheet && hsi != null) {
         ModalBottomSheet(
             onDismissRequest = { showSheet = false },
@@ -342,7 +337,6 @@ fun HsiApp() {
             ) {
                 Text("Display Settings", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 
-                // Display Mode
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf("Single Band", "Global Sum", "RGB").forEach { mode ->
                         FilterChip(
@@ -353,7 +347,6 @@ fun HsiApp() {
                     }
                 }
 
-                // Conditional Sliders
                 if (displayMode == "Single Band") {
                     Text("Band ${selectedBand + 1} / ${hsi!!.bands}   λ = %.1f nm".format(hsi!!.wavelengths[selectedBand]))
                     Slider(
@@ -390,7 +383,151 @@ fun HsiApp() {
     }
 }
 
-// ---------- Canvas & Drawing Functions ----------
+// ---------- Interactive Spectrum Canvas ----------
+@Composable
+fun SpectrumCanvas(data: HsiData, spectra: List<SpectrumRecord>) {
+    val minWl = data.wavelengths.minOrNull() ?: 0f
+    val maxWl = data.wavelengths.maxOrNull() ?: 1f
+    val spanWl = (maxWl - minWl).coerceAtLeast(1e-6f)
+
+    val (minInt, maxInt) = remember(spectra) {
+        var mn = Float.MAX_VALUE
+        var mx = -Float.MAX_VALUE
+        spectra.forEach { rec ->
+            rec.data.forEach { v ->
+                if (v < mn) mn = v
+                if (v > mx) mx = v
+            }
+        }
+        if (spectra.isEmpty()) 0f to 1f else (mn to mx)
+    }
+    val spanInt = (maxInt - minInt).coerceAtLeast(1e-6f)
+
+    // State for interactive crosshair
+    var touchX by remember { mutableStateOf<Float?>(null) }
+
+    Canvas(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragStart = { touchX = it.x },
+                    onDragEnd = { touchX = null },
+                    onDragCancel = { touchX = null }
+                ) { change, _ ->
+                    change.consume()
+                    touchX = change.position.x
+                }
+            }
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onPress = { touchX = it.x },
+                    onTap = { touchX = null }
+                )
+            }
+    ) {
+        val padLeft = 50.dp.toPx()
+        val padBottom = 40.dp.toPx()
+        val padTop = 10.dp.toPx()
+        val padRight = 10.dp.toPx()
+
+        val w = size.width - padLeft - padRight
+        val h = size.height - padTop - padBottom
+
+        // Draw Axes
+        drawLine(Color.Black, Offset(padLeft, padTop), Offset(padLeft, padTop + h), strokeWidth = 2f)
+        drawLine(Color.Black, Offset(padLeft, padTop + h), Offset(padLeft + w, padTop + h), strokeWidth = 2f)
+
+        // Draw Spectra
+        spectra.forEach { rec ->
+            val path = Path()
+            val n = rec.data.size
+            for (i in 0 until n) {
+                val x = padLeft + (i.toFloat() / (n - 1).coerceAtLeast(1)) * w
+                val y = padTop + h - ((rec.data[i] - minInt) / spanInt) * h
+                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            val stroke = if (rec.isReference) Stroke(width = 4f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 10f))) else Stroke(width = 2f)
+            drawPath(path, rec.color, style = stroke)
+        }
+
+        // Interactive Crosshair logic
+        val tx = touchX
+        if (tx != null && tx >= padLeft && tx <= padLeft + w && spectra.isNotEmpty()) {
+            // Draw vertical line
+            drawLine(Color.Gray, Offset(tx, padTop), Offset(tx, padTop + h), strokeWidth = 1f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(5f, 5f)))
+
+            // Calculate Wavelength
+            val frac = (tx - padLeft) / w
+            val wl = minWl + frac * spanWl
+            
+            // Draw circles for each spectrum at this X
+            spectra.forEach { rec ->
+                val idx = (frac * (rec.data.size - 1)).toInt().coerceIn(0, rec.data.size - 1)
+                val valY = rec.data[idx]
+                val py = padTop + h - ((valY - minInt) / spanInt) * h
+                drawCircle(rec.color, radius = 6f, center = Offset(tx, py))
+                drawCircle(Color.White, radius = 6f, center = Offset(tx, py), style = Stroke(2f))
+            }
+
+            // Draw Tooltip Box
+            val textPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.WHITE
+                textSize = 28f
+                textAlign = android.graphics.Paint.Align.CENTER
+            }
+            val boxW = 180f
+            val boxH = 40f
+            val boxX = tx.coerceIn(padLeft + boxW/2, padLeft + w - boxW/2)
+            val boxY = padTop + 10f
+
+            drawRoundRect(
+                color = Color.Black.copy(alpha = 0.7f),
+                topLeft = Offset(boxX - boxW/2, boxY),
+                size = Size(boxW, boxH),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f, 8f)
+            )
+            drawContext.canvas.nativeCanvas.drawText("%.1f nm".format(wl), boxX, boxY + 28f, textPaint)
+        }
+
+        // Draw Axis Text
+        val textPaint = android.graphics.Paint().apply {
+            color = android.graphics.Color.BLACK
+            textSize = 24f
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+        val textPaintY = android.graphics.Paint(textPaint).apply {
+            textAlign = android.graphics.Paint.Align.RIGHT
+        }
+        val titlePaint = android.graphics.Paint(textPaint).apply {
+            textSize = 28f
+            isFakeBoldText = true
+        }
+
+        for (i in 0..4) {
+            val frac = i / 4f
+            val xPos = padLeft + frac * w
+            val valX = minWl + frac * spanWl
+            drawLine(Color.Black, Offset(xPos, padTop + h), Offset(xPos, padTop + h + 5f), strokeWidth = 1f)
+            drawContext.canvas.nativeCanvas.drawText("%.0f".format(valX), xPos, padTop + h + 25f, textPaint)
+        }
+        drawContext.canvas.nativeCanvas.drawText("Wavelength (nm)", padLeft + w/2, size.height - 2f, titlePaint)
+
+        for (i in 0..4) {
+            val frac = i / 4f
+            val yPos = padTop + h - frac * h
+            val valY = minInt + frac * spanInt
+            drawLine(Color.Black, Offset(padLeft, yPos), Offset(padLeft - 5f, yPos), strokeWidth = 1f)
+            drawContext.canvas.nativeCanvas.drawText("%.2f".format(valY), padLeft - 8f, yPos + 8f, textPaintY)
+        }
+        drawContext.canvas.nativeCanvas.save()
+        drawContext.canvas.nativeCanvas.rotate(-90f, 10f, padTop + h/2)
+        drawContext.canvas.nativeCanvas.drawText("Intensity", 10f, padTop + h/2, titlePaint)
+        drawContext.canvas.nativeCanvas.restore()
+    }
+}
+
+// ---------- Heatmap Canvas ----------
 @Composable
 fun HeatmapCanvas(
     data: HsiData,
@@ -556,7 +693,6 @@ fun HeatmapCanvas(
             drawRect(Color.Yellow, topLeft, size, style = Stroke(width = 2f))
         }
 
-        // Draw Axes
         drawLine(Color.Black, Offset(padL, padT), Offset(padL, padT + imgH), strokeWidth = 2f)
         drawLine(Color.Black, Offset(padL, padT + imgH), Offset(padL + imgW, padT + imgH), strokeWidth = 2f)
 
@@ -596,87 +732,7 @@ fun HeatmapCanvas(
     }
 }
 
-@Composable
-fun SpectrumCanvas(data: HsiData, spectra: List<SpectrumRecord>) {
-    val minWl = data.wavelengths.minOrNull() ?: 0f
-    val maxWl = data.wavelengths.maxOrNull() ?: 1f
-    val spanWl = (maxWl - minWl).coerceAtLeast(1e-6f)
-
-    val (minInt, maxInt) = remember(spectra) {
-        var mn = Float.MAX_VALUE
-        var mx = -Float.MAX_VALUE
-        spectra.forEach { rec ->
-            rec.data.forEach { v ->
-                if (v < mn) mn = v
-                if (v > mx) mx = v
-            }
-        }
-        if (spectra.isEmpty()) 0f to 1f else (mn to mx)
-    }
-    val spanInt = (maxInt - minInt).coerceAtLeast(1e-6f)
-
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val padLeft = 50.dp.toPx()
-        val padBottom = 40.dp.toPx()
-        val padTop = 10.dp.toPx()
-        val padRight = 10.dp.toPx()
-
-        val w = size.width - padLeft - padRight
-        val h = size.height - padTop - padBottom
-
-        drawLine(Color.Black, Offset(padLeft, padTop), Offset(padLeft, padTop + h), strokeWidth = 2f)
-        drawLine(Color.Black, Offset(padLeft, padTop + h), Offset(padLeft + w, padTop + h), strokeWidth = 2f)
-
-        spectra.forEach { rec ->
-            val path = Path()
-            val n = rec.data.size
-            for (i in 0 until n) {
-                val x = padLeft + (i.toFloat() / (n - 1).coerceAtLeast(1)) * w
-                val y = padTop + h - ((rec.data[i] - minInt) / spanInt) * h
-                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
-            }
-            val stroke = if (rec.isReference) Stroke(width = 4f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 10f))) else Stroke(width = 2f)
-            drawPath(path, rec.color, style = stroke)
-        }
-
-        val textPaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.BLACK
-            textSize = 24f
-            textAlign = android.graphics.Paint.Align.CENTER
-        }
-        val textPaintY = android.graphics.Paint(textPaint).apply {
-            textAlign = android.graphics.Paint.Align.RIGHT
-        }
-        val titlePaint = android.graphics.Paint(textPaint).apply {
-            textSize = 28f
-            isFakeBoldText = true
-        }
-
-        for (i in 0..4) {
-            val frac = i / 4f
-            val xPos = padLeft + frac * w
-            val valX = minWl + frac * spanWl
-            drawLine(Color.Black, Offset(xPos, padTop + h), Offset(xPos, padTop + h + 5f), strokeWidth = 1f)
-            drawContext.canvas.nativeCanvas.drawText("%.0f".format(valX), xPos, padTop + h + 25f, textPaint)
-        }
-        drawContext.canvas.nativeCanvas.drawText("Wavelength (nm)", padLeft + w/2, size.height - 2f, titlePaint)
-
-        for (i in 0..4) {
-            val frac = i / 4f
-            val yPos = padTop + h - frac * h
-            val valY = minInt + frac * spanInt
-            drawLine(Color.Black, Offset(padLeft, yPos), Offset(padLeft - 5f, yPos), strokeWidth = 1f)
-            drawContext.canvas.nativeCanvas.drawText("%.2f".format(valY), padLeft - 8f, yPos + 8f, textPaintY)
-        }
-        drawContext.canvas.nativeCanvas.save()
-        drawContext.canvas.nativeCanvas.rotate(-90f, 10f, padTop + h/2)
-        drawContext.canvas.nativeCanvas.drawText("Intensity", 10f, padTop + h/2, titlePaint)
-        drawContext.canvas.nativeCanvas.restore()
-    }
-}
-
-// ... (Keep the rest of the helper functions exactly the same: findClosestBand, jetColor, findDataset, loadH5WithPython, saveCsv) ...
-
+// ... (Keep the rest of the helper functions: findClosestBand, jetColor, findDataset, loadH5WithPython, saveCsv) ...
 fun findClosestBand(wls: FloatArray, target: Float): Int {
     var best = 0
     var minDiff = Float.MAX_VALUE
